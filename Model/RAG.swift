@@ -8,12 +8,87 @@
 import Foundation
 import NaturalLanguage
 import FoundationModels
+import CryptoKit
 
+// MARK: - Cache Manager
+class EmbeddingCache {
+    private let cacheDirectory: URL
+    private let cacheQueue = DispatchQueue(label: "com.noterag.embeddingcache", attributes: .concurrent)
+    private var memoryCache = NSCache<NSString, NSData>()
+    
+    init() {
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        self.cacheDirectory = documentsPath.appendingPathComponent("EmbeddingCache")
+        
+        // Create cache directory if it doesn't exist
+        try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        
+        // Configure memory cache
+        memoryCache.countLimit = 1000 // Limit number of cached items
+        memoryCache.totalCostLimit = 50 * 1024 * 1024 // 50MB limit
+    }
+    
+    func getCachedEmbedding(for text: String) -> [Double]? {
+        let key = cacheKey(for: text)
+        
+        // Check memory cache first
+        if let cachedData = memoryCache.object(forKey: key as NSString) as Data? {
+            return deserializeEmbedding(from: cachedData)
+        }
+        
+        // Check disk cache
+        let fileURL = cacheDirectory.appendingPathComponent(key)
+        if let data = try? Data(contentsOf: fileURL) {
+            // Add to memory cache for faster future access
+            memoryCache.setObject(data as NSData, forKey: key as NSString, cost: data.count)
+            return deserializeEmbedding(from: data)
+        }
+        
+        return nil
+    }
+    
+    func cacheEmbedding(_ embedding: [Double], for text: String) {
+        let key = cacheKey(for: text)
+        let data = serializeEmbedding(embedding)
+        
+        cacheQueue.async(flags: .barrier) {
+            // Save to memory cache
+            self.memoryCache.setObject(data as NSData, forKey: key as NSString, cost: data.count)
+            
+            // Save to disk cache
+            let fileURL = self.cacheDirectory.appendingPathComponent(key)
+            try? data.write(to: fileURL)
+        }
+    }
+    
+    func clearCache() {
+        memoryCache.removeAllObjects()
+        try? FileManager.default.removeItem(at: cacheDirectory)
+        try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+    }
+    
+    private func cacheKey(for text: String) -> String {
+        let data = Data(text.utf8)
+        let hash = SHA256.hash(data: data)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+    
+    private func serializeEmbedding(_ embedding: [Double]) -> Data {
+        return try! JSONEncoder().encode(embedding)
+    }
+    
+    private func deserializeEmbedding(from data: Data) -> [Double]? {
+        return try? JSONDecoder().decode([Double].self, from: data)
+    }
+}
+
+// MARK: - Document Class
 class Document {
     let id: String
     let content: String
     var sentenceEmbeddings: [(sentence: String, embedding: [Double])]
     var chunks: [(text: String, embedding: [Double])]
+    var isProcessed: Bool = false
 
     init(id: String, content: String) {
         self.id = id
@@ -23,15 +98,20 @@ class Document {
     }
 }
 
+// MARK: - RAG Class
 class RAG {
     private var documents: [Document] = []
     private let sentenceEmbedding: NLEmbedding
     private let languageRecognizer = NLLanguageRecognizer()
+    private let embeddingCache = EmbeddingCache()
+    private let processingQueue = DispatchQueue(label: "com.noterag.processing", attributes: .concurrent)
+    private let documentQueue = DispatchQueue(label: "com.noterag.documents", attributes: .concurrent)
     
     // Configuration options
     private let chunkSize = 200 // characters per chunk
     private let chunkOverlap = 50 // overlap between chunks
     private let useChunking = true // Toggle between sentence and chunk-based retrieval
+    private let maxConcurrentProcessing = 4 // Max documents to process simultaneously
     
     init() {
         // Try to use sentence embedding first, fallback to word embedding
@@ -44,49 +124,131 @@ class RAG {
         }
     }
     
-    func addDocument(_ document: Document) {
+    // MARK: - Async Document Processing
+    
+    func addDocument(_ document: Document) async {
+        await withCheckedContinuation { continuation in
+            addDocument(document) {
+                continuation.resume()
+            }
+        }
+    }
+    
+    func addDocument(_ document: Document, completion: @escaping () -> Void) {
+        processingQueue.async {
+            self.processDocument(document)
+            
+            self.documentQueue.async(flags: .barrier) {
+                self.documents.append(document)
+                completion()
+            }
+        }
+    }
+    
+    func addDocuments(_ documents: [Document]) async {
+        await withTaskGroup(of: Void.self) { group in
+            // Limit concurrent processing
+            let semaphore = DispatchSemaphore(value: maxConcurrentProcessing)
+            
+            for document in documents {
+                group.addTask {
+                    await withCheckedContinuation { continuation in
+                        semaphore.wait()
+                        self.addDocument(document) {
+                            semaphore.signal()
+                            continuation.resume()
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    private func processDocument(_ document: Document) {
         if useChunking {
             // Chunk-based approach for longer documents
             let chunks = createChunks(from: document.content)
             var chunkEmbeddings: [(String, [Double])] = []
             
-            for chunk in chunks {
-                if let embedding = getEnhancedEmbedding(for: chunk) {
-                    chunkEmbeddings.append((chunk, embedding))
+            // Process chunks in parallel
+            let chunkGroup = DispatchGroup()
+            let chunkQueue = DispatchQueue(label: "com.noterag.chunks", attributes: .concurrent)
+            var tempEmbeddings = [(Int, String, [Double])]()
+            
+            for (index, chunk) in chunks.enumerated() {
+                chunkGroup.enter()
+                chunkQueue.async {
+                    if let embedding = self.getCachedOrComputeEmbedding(for: chunk) {
+                        chunkQueue.async(flags: .barrier) {
+                            tempEmbeddings.append((index, chunk, embedding))
+                        }
+                    }
+                    chunkGroup.leave()
                 }
             }
+            
+            chunkGroup.wait()
+            
+            // Sort by original index to maintain order
+            tempEmbeddings.sort { $0.0 < $1.0 }
+            chunkEmbeddings = tempEmbeddings.map { ($0.1, $0.2) }
+            
             document.chunks = chunkEmbeddings
         } else {
             // Sentence-based approach
             let sentences = extractSentences(from: document.content)
             var sentenceEmbeddings: [(String, [Double])] = []
             
-            for sentence in sentences {
-                if let embedding = getEnhancedEmbedding(for: sentence) {
-                    sentenceEmbeddings.append((sentence, embedding))
+            // Process sentences in parallel
+            let sentenceGroup = DispatchGroup()
+            let sentenceQueue = DispatchQueue(label: "com.noterag.sentences", attributes: .concurrent)
+            var tempEmbeddings = [(Int, String, [Double])]()
+            
+            for (index, sentence) in sentences.enumerated() {
+                sentenceGroup.enter()
+                sentenceQueue.async {
+                    if let embedding = self.getCachedOrComputeEmbedding(for: sentence) {
+                        sentenceQueue.async(flags: .barrier) {
+                            tempEmbeddings.append((index, sentence, embedding))
+                        }
+                    }
+                    sentenceGroup.leave()
                 }
             }
+            
+            sentenceGroup.wait()
+            
+            // Sort by original index to maintain order
+            tempEmbeddings.sort { $0.0 < $1.0 }
+            sentenceEmbeddings = tempEmbeddings.map { ($0.1, $0.2) }
+            
             document.sentenceEmbeddings = sentenceEmbeddings
         }
         
-        documents.append(document)
+        document.isProcessed = true
     }
     
+    // MARK: - Search Methods with Caching
+    
     func searchRelevantSentences(for query: String, limit: Int = 3) -> [(documentID: String, text: String, similarity: Double)] {
-        guard let queryEmbedding = getEnhancedEmbedding(for: query) else { return [] }
+        guard let queryEmbedding = getCachedOrComputeEmbedding(for: query) else { return [] }
         
         var scored: [(String, String, Double)] = []
         
-        for doc in documents {
-            if useChunking {
-                for (chunk, embedding) in doc.chunks {
-                    let sim = cosineSimilarity(queryEmbedding, embedding)
-                    scored.append((doc.id, chunk, sim))
-                }
-            } else {
-                for (sentence, embedding) in doc.sentenceEmbeddings {
-                    let sim = cosineSimilarity(queryEmbedding, embedding)
-                    scored.append((doc.id, sentence, sim))
+        documentQueue.sync {
+            for doc in documents {
+                guard doc.isProcessed else { continue }
+                
+                if useChunking {
+                    for (chunk, embedding) in doc.chunks {
+                        let sim = cosineSimilarity(queryEmbedding, embedding)
+                        scored.append((doc.id, chunk, sim))
+                    }
+                } else {
+                    for (sentence, embedding) in doc.sentenceEmbeddings {
+                        let sim = cosineSimilarity(queryEmbedding, embedding)
+                        scored.append((doc.id, sentence, sim))
+                    }
                 }
             }
         }
@@ -135,7 +297,23 @@ class RAG {
         return response
     }
     
-    // MARK: - Enhanced Embedding Methods
+    // MARK: - Enhanced Embedding Methods with Caching
+    
+    private func getCachedOrComputeEmbedding(for text: String) -> [Double]? {
+        // Check cache first
+        if let cachedEmbedding = embeddingCache.getCachedEmbedding(for: text) {
+            return cachedEmbedding
+        }
+        
+        // Compute embedding
+        if let embedding = getEnhancedEmbedding(for: text) {
+            // Cache the result
+            embeddingCache.cacheEmbedding(embedding, for: text)
+            return embedding
+        }
+        
+        return nil
+    }
     
     private func getEnhancedEmbedding(for text: String) -> [Double]? {
         let cleanedText = preprocessText(text)
@@ -291,5 +469,27 @@ class RAG {
         let magnitude2 = sqrt(v2.map { $0 * $0 }.reduce(0, +))
         guard magnitude1 > 0 && magnitude2 > 0 else { return 0 }
         return dotProduct / (magnitude1 * magnitude2)
+    }
+    
+    // MARK: - Cache Management
+    
+    func clearCache() {
+        embeddingCache.clearCache()
+    }
+    
+    func preloadDocuments() async {
+        // Ensure all documents are processed
+        await withTaskGroup(of: Void.self) { group in
+            for document in documents where !document.isProcessed {
+                group.addTask {
+                    await withCheckedContinuation { continuation in
+                        self.processingQueue.async {
+                            self.processDocument(document)
+                            continuation.resume()
+                        }
+                    }
+                }
+            }
+        }
     }
 }
