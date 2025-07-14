@@ -22,7 +22,7 @@ import Playgrounds
     rag.addDocument(Document(id: "9", content: "Rainforests are vital ecosystems that are home to a vast diversity of plant and animal species."))
     rag.addDocument(Document(id: "10", content: "The internet of things (IoT) connects everyday devices to the internet, enabling smarter homes and cities."))
     
-    let query = "How many pets do I have?"
+    let query = "What is that term called that connects online devices?"
     let response = try await rag.generateResponse(for: query)
     
     print("Question: \(query)")
