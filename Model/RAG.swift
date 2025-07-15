@@ -106,6 +106,8 @@ class RAG {
     private let embeddingCache = EmbeddingCache()
     private let processingQueue = DispatchQueue(label: "com.noterag.processing", attributes: .concurrent)
     private let documentQueue = DispatchQueue(label: "com.noterag.documents", attributes: .concurrent)
+    private let embeddingQueue = DispatchQueue(label: "com.noterag.embedding", qos: .userInitiated)
+    private let embeddingQueueKey = DispatchSpecificKey<Void>()
     
     // Configuration options
     private let chunkSize = 200 // characters per chunk
@@ -114,6 +116,9 @@ class RAG {
     private let maxConcurrentProcessing = 4 // Max documents to process simultaneously
     
     init() {
+        // Set up queue-specific key to detect if we're on the embedding queue
+        embeddingQueue.setSpecific(key: embeddingQueueKey, value: ())
+        
         // Try to use sentence embedding first, fallback to word embedding
         if let sentenceModel = NLEmbedding.sentenceEmbedding(for: .english) {
             self.sentenceEmbedding = sentenceModel
@@ -260,7 +265,7 @@ class RAG {
         return Array(sorted.prefix(limit))
     }
     
-    func generateResponse(for query: String) async throws -> LanguageModelSession.Response<String> {
+    func generateResponse(for query: String) async throws -> String {
         let topResults = searchRelevantSentences(for: query)
         
         // Deduplicate and aggregate context from same documents
@@ -294,7 +299,7 @@ class RAG {
         let session = LanguageModelSession()
         let response = try await session.respond(to: prompt)
         
-        return response
+        return response.content
     }
     
     // MARK: - Enhanced Embedding Methods with Caching
@@ -318,14 +323,26 @@ class RAG {
     private func getEnhancedEmbedding(for text: String) -> [Double]? {
         let cleanedText = preprocessText(text)
         
-        // Try sentence embedding first (if available)
-        if let directEmbedding = sentenceEmbedding.vector(for: cleanedText),
-           !directEmbedding.isEmpty {
-            return normalizeVector(directEmbedding)
+        // Check if we're already on the embedding queue
+        if DispatchQueue.getSpecific(key: embeddingQueueKey) != nil {
+            // We're already on the embedding queue, process directly
+            if let directEmbedding = sentenceEmbedding.vector(for: cleanedText),
+               !directEmbedding.isEmpty {
+                return normalizeVector(directEmbedding)
+            }
+            
+            return getWeightedWordEmbedding(for: cleanedText)
+        } else {
+            // We're on a different queue, dispatch to embedding queue
+            return embeddingQueue.sync {
+                if let directEmbedding = sentenceEmbedding.vector(for: cleanedText),
+                   !directEmbedding.isEmpty {
+                    return normalizeVector(directEmbedding)
+                }
+                
+                return getWeightedWordEmbedding(for: cleanedText)
+            }
         }
-        
-        // Fallback to weighted word embeddings
-        return getWeightedWordEmbedding(for: cleanedText)
     }
     
     private func getWeightedWordEmbedding(for text: String) -> [Double]? {
@@ -339,9 +356,10 @@ class RAG {
             let word = String(text[range])
             let lemma = tagger.tag(at: range.lowerBound, unit: .word, scheme: .lemma).0?.rawValue ?? word
             
-            if let embedding = sentenceEmbedding.vector(for: lemma.lowercased()) {
+            // Access sentenceEmbedding synchronously since we're already on embeddingQueue
+            if let embedding = self.sentenceEmbedding.vector(for: lemma.lowercased()) {
                 // Weight based on part of speech
-                let weight = getWeight(for: tag)
+                let weight = self.getWeight(for: tag)
                 weightedEmbeddings.append((embedding, weight))
             }
             
